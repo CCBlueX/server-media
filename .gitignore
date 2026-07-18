@@ -101,3 +101,7 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+### Generated ###
+/index.json
+/site/

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Generate an aggregated domain->server index over minecraft_servers/*/manifest.json.
+
+Usage: generate-index.py [OUTPUT_PATH]   (default: ./index.json)
+
+Exits non-zero only on JSON parse errors or a missing required manifest field;
+everything else (malformed wildcards, duplicate domain claims) is skipped with
+a warning on stderr.
+"""
+
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+REQUIRED_FIELDS = ("server_name", "nice_name", "direct_ip")
+
+
+def warn(msg: str) -> None:
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def host_of(value: str) -> str:
+    """Lowercase a host and strip a trailing :port if present."""
+    host = value.strip().lower()
+    if ":" in host:
+        head, _, tail = host.rpartition(":")
+        if tail.isdigit():
+            host = head
+    return host
+
+
+def wildcard_base(entry: str) -> str | None:
+    """'%.hypixel.net' -> 'hypixel.net'; None for malformed entries."""
+    if not isinstance(entry, str):
+        return None
+    base = entry.strip().lower()
+    for prefix in ("%.", "*."):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+    base = host_of(base)
+    if not base or "%" in base or "*" in base:
+        return None
+    return base
+
+
+def main() -> int:
+    out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./index.json")
+    repo_root = Path(__file__).resolve().parent.parent
+    servers_dir = repo_root / "minecraft_servers"
+
+    servers: dict[str, dict] = {}
+    domains: dict[str, str] = {}
+    errors = 0
+
+    for manifest_path in sorted(servers_dir.glob("*/manifest.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            print(f"error: {manifest_path}: invalid JSON: {exc}", file=sys.stderr)
+            errors += 1
+            continue
+
+        missing = [f for f in REQUIRED_FIELDS if not manifest.get(f)]
+        if missing:
+            print(f"error: {manifest_path}: missing required field(s): {', '.join(missing)}",
+                  file=sys.stderr)
+            errors += 1
+            continue
+
+        name = manifest["server_name"]
+        folder = manifest_path.parent
+        entry = {
+            "nice_name": manifest["nice_name"],
+            "direct_ip": manifest["direct_ip"],
+            "background": (folder / "background.png").is_file(),
+            "logo": (folder / "logo.png").is_file(),
+            "banner": (folder / "banner.png").is_file(),
+        }
+
+        wildcards = manifest.get("server_wildcards")
+        if not isinstance(wildcards, list):
+            if wildcards is not None:
+                warn(f"{name}: server_wildcards is not a list; ignoring")
+            wildcards = []
+        if wildcards:
+            entry["wildcards"] = [w for w in wildcards if isinstance(w, str)]
+        servers[name] = entry
+
+        claims = [host_of(manifest["direct_ip"])]
+        for wildcard in wildcards:
+            base = wildcard_base(wildcard)
+            if base is None:
+                warn(f"{name}: skipping malformed wildcard {wildcard!r}")
+            else:
+                claims.append(base)
+
+        for domain in claims:
+            if not domain:
+                warn(f"{name}: skipping empty domain claim")
+            elif domain in domains and domains[domain] != name:
+                warn(f"{name}: domain {domain!r} already claimed by {domains[domain]!r}; keeping first")
+            else:
+                domains[domain] = name
+
+    index = {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "servers": servers,
+        "domains": domains,
+    }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"wrote {out_path}: {len(servers)} servers, {len(domains)} domains", file=sys.stderr)
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

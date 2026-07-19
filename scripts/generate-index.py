@@ -15,6 +15,21 @@ from pathlib import Path
 
 REQUIRED_FIELDS = ("server_name", "nice_name", "direct_ip")
 
+# Common multi-label public suffixes; a host ending in one of these keeps three
+# labels as its root domain instead of two (foo.com.br, not com.br). Stdlib-only
+# stand-in for the full public suffix list, extend as manifests need it.
+MULTI_LABEL_SUFFIXES = frozenset({
+    "co.uk", "org.uk", "me.uk", "net.uk", "ac.uk", "gov.uk",
+    "com.br", "net.br", "org.br",
+    "com.au", "net.au", "org.au",
+    "com.ar", "com.mx", "com.co", "com.ve", "com.pe", "com.ec",
+    "com.tr", "com.pl", "net.pl", "org.pl", "com.ua",
+    "co.za", "co.nz", "co.in", "co.il", "co.id", "co.th",
+    "co.jp", "ne.jp", "or.jp", "co.kr",
+    "com.sg", "com.my", "com.ph", "com.hk", "com.tw", "com.cn", "net.cn",
+    "com.eg", "com.sa", "com.vn",
+})
+
 
 def warn(msg: str) -> None:
     print(f"warning: {msg}", file=sys.stderr)
@@ -45,6 +60,15 @@ def wildcard_base(entry: str) -> str | None:
     return base
 
 
+def root_domain(host: str) -> str:
+    """Reduce a host to its registrable root domain: 'eu.minemen.club' -> 'minemen.club'."""
+    labels = host.split(".")
+    if len(labels) <= 2 or all(l.isdigit() for l in labels):
+        return host
+    keep = 3 if ".".join(labels[-2:]) in MULTI_LABEL_SUFFIXES else 2
+    return ".".join(labels[-keep:])
+
+
 def main() -> int:
     out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./index.json")
     repo_root = Path(__file__).resolve().parent.parent
@@ -52,6 +76,8 @@ def main() -> int:
 
     servers: dict[str, dict] = {}
     domains: dict[str, str] = {}
+    direct_claims: list[tuple[str, str]] = []
+    wildcard_claims: list[tuple[str, str]] = []
     errors = 0
 
     for manifest_path in sorted(servers_dir.glob("*/manifest.json")):
@@ -88,21 +114,25 @@ def main() -> int:
             entry["wildcards"] = [w for w in wildcards if isinstance(w, str)]
         servers[name] = entry
 
-        claims = [host_of(manifest["direct_ip"])]
+        direct = root_domain(host_of(manifest["direct_ip"]))
+        if direct:
+            direct_claims.append((name, direct))
+        else:
+            warn(f"{name}: skipping empty domain claim")
         for wildcard in wildcards:
             base = wildcard_base(wildcard)
             if base is None:
                 warn(f"{name}: skipping malformed wildcard {wildcard!r}")
             else:
-                claims.append(base)
+                wildcard_claims.append((name, root_domain(base)))
 
-        for domain in claims:
-            if not domain:
-                warn(f"{name}: skipping empty domain claim")
-            elif domain in domains and domains[domain] != name:
-                warn(f"{name}: domain {domain!r} already claimed by {domains[domain]!r}; keeping first")
-            else:
-                domains[domain] = name
+    # Direct IPs claim their root domain before wildcards do, so a server's own
+    # domain can't be shadowed by another server's wildcard on a subdomain of it.
+    for name, domain in direct_claims + wildcard_claims:
+        if domain in domains and domains[domain] != name:
+            warn(f"{name}: domain {domain!r} already claimed by {domains[domain]!r}; keeping first")
+        else:
+            domains[domain] = name
 
     index = {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
